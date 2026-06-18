@@ -1,0 +1,592 @@
+---
+title: "NAFLD Transcriptomic Analysis"
+author: "Nicolas Legrand"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+
+## 1. Dataset loading and initial exploration
+# Load GEO dataset and inspect expression matrix + metadata
+
+```{r setup}
+# ---- Setup ----
+library(GEOquery)
+library(tidyverse)
+
+# ---- Download GEO dataset ----
+gse <- getGEO("GSE135251", GSEMatrix = TRUE)
+
+# Verify download
+length(gse)
+names(gse)
+
+expr <- exprs(gse[[1]])
+meta <- pData(gse[[1]])
+
+dim(expr)
+head(expr[,1:5])
+head(meta)
+
+```
+
+## 2. Download and extract raw count files
+# Retrieve supplementary files and extract raw featureCounts outputs
+
+```{r download raw}
+library(GEOquery)
+
+# Télécharger les fichiers supplémentaires (RAW)
+getGEOSuppFiles("GSE135251")
+
+# Décompresser l’archive RAW dans un sous-dossier
+untar("GSE135251/GSE135251_RAW.tar", exdir = "GSE135251/raw")
+
+# Lister les fichiers disponibles
+list.files("GSE135251/raw")
+
+```
+## 3. Merge raw count files into a single count matrix
+# Read all featureCounts files and merge them by Geneid
+
+```{r merge_counts}
+# ---- merge_counts_fixed ----
+
+library(tidyverse)
+
+files <- list.files("GSE135251/raw", full.names = TRUE)
+
+read_count_file <- function(f) {
+  df <- read.delim(f, header = TRUE)
+  
+  # Identify gene column (Geneid or first column)
+  gene_col <- grep("Geneid|gene|Gene|ID", colnames(df), ignore.case = TRUE)
+  if (length(gene_col) == 0) gene_col <- 1
+  
+  # Identify count column (usually second column)
+  count_col <- grep("count|Counts|read", colnames(df), ignore.case = TRUE)
+  if (length(count_col) == 0) count_col <- 2
+  
+  df <- df[, c(gene_col[1], count_col[1])]
+  colnames(df) <- c("Geneid", basename(f))
+  
+  return(df)
+}
+
+# Read all files
+count_list <- lapply(files, read_count_file)
+
+# Merge all by Geneid
+counts <- Reduce(function(x, y) merge(x, y, by = "Geneid", all = TRUE), count_list)
+
+# Replace NA by 0
+counts[is.na(counts)] <- 0
+
+# Set rownames
+rownames(counts) <- counts$Geneid
+counts <- counts[, -1]
+
+# Check
+dim(counts)
+counts[1:5, 1:5]
+
+```
+## 4. Clean count matrix
+# Remove featureCounts summary rows and convert to integer matrix
+
+```{r clean_counts}
+# ---- clean_counts ----
+
+# Remove featureCounts summary rows
+bad_rows <- grep("^__", rownames(counts))
+length(bad_rows)   # should be 5
+
+counts_clean <- counts[-bad_rows, ]
+
+# Convert to integer matrix (DESeq2 requirement)
+counts_clean <- as.matrix(counts_clean)
+mode(counts_clean) <- "integer"
+
+# Check again
+dim(counts_clean)
+counts_clean[1:5, 1:5]
+
+```
+
+## 5. Clean and format metadata
+# Select relevant columns and create the condition factor
+
+```{r clean_metadata}
+
+# ---- clean_metadata ----
+
+library(dplyr)
+library(stringr)
+
+# Start from meta
+meta_clean <- meta %>%
+  dplyr::select(`group in paper:ch1`, `fibrosis stage:ch1`, `nas score:ch1`)
+
+# Rename columns for clarity
+meta_clean <- meta_clean %>%
+  dplyr::rename(
+    group = `group in paper:ch1`,
+    fibrosis_stage = `fibrosis stage:ch1`,
+    nas_score = `nas score:ch1`
+  )
+
+# Extract condition from group
+meta_clean$condition <- meta_clean$group
+
+# Make condition a factor
+meta_clean$condition <- factor(meta_clean$condition)
+
+# Check
+table(meta_clean$condition)
+head(meta_clean)
+
+
+```
+
+```{r clean_colnames}
+# ---- clean_colnames ----
+
+# Extract GSM ID from filenames
+clean_names <- colnames(counts_clean) %>%
+  stringr::str_extract("GSM[0-9]+")
+
+# Replace column names
+colnames(counts_clean) <- clean_names
+
+# Check
+head(colnames(counts_clean))
+
+```
+## 6. Align metadata with count matrix
+# Ensure sample names match between counts and metadata
+
+```{r check_alignment}
+# ---- check_alignment2 ----
+
+# Check again
+all(colnames(counts_clean) == rownames(meta_clean))
+
+# Align metadata to counts
+meta_aligned <- meta_clean[colnames(counts_clean), ]
+
+# Check
+all(colnames(counts_clean) == rownames(meta_aligned))
+
+head(meta_aligned)
+
+```
+
+## 7. Create DESeq2 dataset
+# Build DESeq2 object and filter low-count genes
+
+```{r create_dds}
+# ---- create_dds ----
+
+library(DESeq2)
+
+# Build DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_clean,
+  colData   = meta_aligned,
+  design    = ~ condition
+)
+
+# Remove genes with very low counts
+dds <- dds[rowSums(counts(dds)) > 10, ]
+
+dds
+
+```
+## 8. Differential expression model
+# Run DESeq2 and list available contrasts
+
+
+```{r run_deseq}
+# ---- run_deseq ----
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Extract results for all conditions vs reference
+# By default, reference = first level of condition
+resultsNames(dds)
+
+```
+
+```{r NAFL vs control}
+# ---- results_NAFL_vs_control ----
+
+res_nafl <- results(dds, contrast = c("condition", "NAFL", "control"))
+summary(res_nafl)
+
+```
+
+
+```{r NASH_F2 vs NASH_F0-F1}
+# ---- results_NASH_F2_vs_F0F1 ----
+
+res_f2 <- results(dds, contrast = c("condition", "NASH_F2", "NASH_F0-F1"))
+summary(res_f2)
+
+```
+## 9. Extract results for main contrast (NASH F2 vs F0–F1)
+# Annotate genes and classify DEGs
+
+```{r extract_results_F2_vs_F0F1 }
+# ---- extract_results_F2_vs_F0F1 ----
+
+library(tidyverse)
+
+res_df <- as.data.frame(res_f2) %>%
+  rownames_to_column("ensembl_id") %>%
+  filter(!is.na(padj))
+
+# Add gene annotation
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+gene_anno <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = res_df$ensembl_id,
+  keytype = "ENSEMBL",
+  columns = c("ENSEMBL", "SYMBOL", "GENENAME", "ENTREZID")
+) %>% distinct(ENSEMBL, .keep_all = TRUE)
+
+res_ann <- res_df %>%
+  left_join(gene_anno, by = c("ensembl_id" = "ENSEMBL")) %>%
+  mutate(
+    label = if_else(!is.na(SYMBOL), SYMBOL, ensembl_id),
+    direction = case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "UP",
+      padj < 0.05 & log2FoldChange < -1 ~ "DOWN",
+      TRUE ~ "NS"
+    ),
+    neg_log10_padj = -log10(padj)
+  )
+
+head(res_ann)
+table(res_ann$direction)
+
+```
+## 10. PCA for global sample structure
+# Visualize sample clustering using VST-transformed data
+
+
+```{r vst_pca}
+# ---- vst_pca ----
+
+vst_data <- vst(dds, blind = FALSE)
+
+pca_data <- plotPCA(vst_data, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"), 1)
+
+library(ggplot2)
+
+ggplot(pca_data, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA — NASH_F2 vs NASH_F0-F1",
+    x = paste0("PC1 (", percentVar[1], "%)"),
+    y = paste0("PC2 (", percentVar[2], "%)")
+  ) +
+  theme_bw()
+
+```
+## 11. Sample-to-sample distance heatmap
+# Assess global similarity between samples
+
+
+```{r sample_distances}
+# ---- sample_distances ----
+
+library(pheatmap)
+
+dist_mat <- dist(t(assay(vst_data)))
+dist_mat <- as.matrix(dist_mat)
+
+pheatmap(
+  dist_mat,
+  annotation_col = meta_aligned["condition"],
+  main = "Sample-to-sample distances"
+)
+
+```
+## 12. Volcano plot (NASH F2 vs F0–F1)
+# Visualize significant DEGs
+
+```{r volcano_F2_vs_F0F1}
+# ---- volcano_F2_vs_F0F1 ----
+
+library(ggrepel)
+
+ggplot(res_ann, aes(log2FoldChange, neg_log10_padj, color = direction)) +
+  geom_point(alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  scale_color_manual(values = c(UP = "red", DOWN = "blue", NS = "grey")) +
+  labs(
+    title = "Volcano — NASH_F2 vs NASH_F0-F1",
+    x = "log2 Fold Change",
+    y = "-log10 adjusted p-value"
+  ) +
+  theme_bw()
+
+```
+
+## 13. Heatmap of top 50 DEGs
+# Highlight most significant genes in the contrast
+
+```{r heatmap_top50_F2_vs_F0F1 }
+# ---- heatmap_top50_F2_vs_F0F1 ----
+
+top50 <- res_ann %>%
+  filter(direction != "NS") %>%
+  arrange(padj) %>%
+  slice_head(n = 50) %>%
+  pull(ensembl_id)
+
+vst_mat <- assay(vst_data)[top50, ]
+vst_mat <- t(scale(t(vst_mat)))
+
+pheatmap(
+  vst_mat,
+  annotation_col = meta_aligned["condition"],
+  show_rownames = TRUE,
+  main = "Top 50 DEGs — NASH_F2 vs NASH_F0-F1"
+)
+
+```
+## 14. GO enrichment analysis (F2 vs F0–F1)
+# Identify enriched biological processes
+
+
+```{r enrichment_F2_vs_F0F1}
+# ---- enrichment_F2_vs_F0F1 ----
+
+library(clusterProfiler)
+library(enrichplot)
+
+up_genes <- res_ann %>% filter(direction == "UP", !is.na(ENTREZID)) %>% pull(ENTREZID)
+down_genes <- res_ann %>% filter(direction == "DOWN", !is.na(ENTREZID)) %>% pull(ENTREZID)
+universe <- res_ann %>% filter(!is.na(ENTREZID)) %>% pull(ENTREZID)
+
+go_up <- enrichGO(
+  gene = up_genes,
+  universe = universe,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+dotplot(go_up, showCategory = 20) + ggtitle("GO — Upregulated (F2 vs F0-F1)")
+
+```
+### Recap — NASH F2 vs F0–F1
+
+- **DEGs:** 27 upregulated, 2 downregulated  
+- **PCA:** low variance explained (≈14% + 10%), consistent with subtle biological transition  
+- **Volcano:** few significant genes, but clear immune-related hits  
+- **Heatmap:** moderate separation, expected due to patient heterogeneity  
+- **GO enrichment:** strong immune signature  
+  - Response to bacteria (GeneRatio ≈ 0.275)  
+  - Antimicrobial humoral response (≈0.225)  
+  - Chemotaxis (≈0.225)  
+
+**Interpretation:** Early fibrotic activation driven by immune recruitment and antimicrobial signaling.
+
+
+
+## 15. Extract results for secondary contrast (NAFL vs Control)
+# Annotate genes and classify DEGs
+
+```{r extract_results_NAFL_vs_control}
+# ---- extract_results_NAFL_vs_control ----
+
+library(tidyverse)
+
+res_df_nafl <- as.data.frame(res_nafl) %>%
+  rownames_to_column("ensembl_id") %>%
+  filter(!is.na(padj))
+
+# Annotation
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+gene_anno <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = res_df_nafl$ensembl_id,
+  keytype = "ENSEMBL",
+  columns = c("ENSEMBL", "SYMBOL", "GENENAME", "ENTREZID")
+) %>% distinct(ENSEMBL, .keep_all = TRUE)
+
+res_nafl_ann <- res_df_nafl %>%
+  left_join(gene_anno, by = c("ensembl_id" = "ENSEMBL")) %>%
+  mutate(
+    label = if_else(!is.na(SYMBOL), SYMBOL, ensembl_id),
+    direction = case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "UP",
+      padj < 0.05 & log2FoldChange < -1 ~ "DOWN",
+      TRUE ~ "NS"
+    ),
+    neg_log10_padj = -log10(padj)
+  )
+
+table(res_nafl_ann$direction)
+
+```
+## 16. Volcano plot (NAFL vs Control)
+# Visualize large-scale metabolic dysregulation
+
+```{r volcano_NAFL_vs_control}
+# ---- volcano_NAFL_vs_control ----
+
+library(ggrepel)
+
+ggplot(res_nafl_ann, aes(log2FoldChange, neg_log10_padj, color = direction)) +
+  geom_point(alpha = 0.6) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  scale_color_manual(values = c(UP = "red", DOWN = "blue", NS = "grey")) +
+  labs(
+    title = "Volcano — NAFL vs control",
+    x = "log2 Fold Change",
+    y = "-log10 adjusted p-value"
+  ) +
+  theme_bw()
+
+```
+## 17. Heatmap of top 50 DEGs (NAFL vs Control)
+# Show major metabolic gene shifts
+
+```{r heatmap_top50_NAFL_vs_control}
+# ---- heatmap_top50_NAFL_vs_control ----
+
+top50_nafl <- res_nafl_ann %>%
+  filter(direction != "NS") %>%
+  arrange(padj) %>%
+  slice_head(n = 50) %>%
+  pull(ensembl_id)
+
+vst_mat <- assay(vst_data)[top50_nafl, ]
+vst_mat <- t(scale(t(vst_mat)))
+
+pheatmap(
+  vst_mat,
+  annotation_col = meta_aligned["condition"],
+  show_rownames = TRUE,
+  main = "Top 50 DEGs — NAFL vs control"
+)
+
+```
+## 18. GO enrichment analysis (NAFL vs Control)
+# Identify metabolic pathways altered in NAFL
+
+```{r enrichment_NAFL_vs_control}
+# ---- enrichment_NAFL_vs_control ----
+
+library(clusterProfiler)
+library(enrichplot)
+
+up_nafl <- res_nafl_ann %>% filter(direction == "UP", !is.na(ENTREZID)) %>% pull(ENTREZID)
+down_nafl <- res_nafl_ann %>% filter(direction == "DOWN", !is.na(ENTREZID)) %>% pull(ENTREZID)
+universe_nafl <- res_nafl_ann %>% filter(!is.na(ENTREZID)) %>% pull(ENTREZID)
+
+go_up_nafl <- enrichGO(
+  gene = up_nafl,
+  universe = universe_nafl,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+dotplot(go_up_nafl, showCategory = 20) + ggtitle("GO — Upregulated (NAFL vs control)")
+
+```
+### Recap — NAFL vs Control
+
+- **DEGs:** 1102 upregulated, 1838 downregulated  
+- **Volcano:** dense and highly significant metabolic signal  
+- **Heatmap:** strong separation between control and NAFL  
+- **GO enrichment:** metabolic reprogramming  
+  - Lipid metabolic regulation (≈25/30 genes, GeneRatio ≈ 0.045)  
+  - Cholesterol biosynthesis (≈10/15 genes, GeneRatio ≈ 0.015)  
+  - Sterol/secondary alcohol biosynthesis (≈10/15 genes, GeneRatio ≈ 0.015)  
+
+**Interpretation:** Massive metabolic shift consistent with early NAFLD.
+
+
+# Final Summary
+
+## Two-step model of NAFLD progression
+
+1. **Metabolic dysregulation (NAFL stage)**  
+   - Large number of DEGs  
+   - Strong enrichment for lipid and cholesterol metabolism  
+   - Clear separation between healthy and NAFL samples  
+
+2. **Immune activation (transition to fibrotic NASH)**  
+   - Few DEGs but highly specific pathways  
+   - Antimicrobial response, chemotaxis, humoral immunity  
+   - Matches early fibrogenesis described in the literature  
+
+## Visual Recap Table
+
+```{r summary_table}
+# ---- summary_table ----
+library(knitr)
+library(kableExtra)
+
+summary_df <- data.frame(
+  Contrast = c("NAFL vs Control", "NASH F2 vs F0-F1"),
+  Up_DEGs = c(1102, 27),
+  Down_DEGs = c(1838, 2),
+  Main_Theme = c("Metabolic reprogramming", "Immune activation"),
+  Key_Pathways = c(
+    "Lipid metabolism, cholesterol biosynthesis",
+    "Antimicrobial response, chemotaxis"
+  )
+)
+
+kable(summary_df, format = "html", caption = "Summary of Differential Expression Results") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+```
+
+```{r summary_plot}
+# ---- summary_plot ----
+library(ggplot2)
+
+summary_plot_df <- data.frame(
+  Contrast = c("NAFL vs Control", "NASH F2 vs F0-F1"),
+  Up = c(1102, 27),
+  Down = c(1838, 2)
+)
+
+summary_plot_df_long <- summary_plot_df %>%
+  tidyr::pivot_longer(cols = c("Up", "Down"), names_to = "Direction", values_to = "Count")
+
+ggplot(summary_plot_df_long, aes(x = Contrast, y = Count, fill = Direction)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("Up" = "red", "Down" = "blue")) +
+  labs(
+    title = "Differentially Expressed Genes per Contrast",
+    y = "Number of DEGs",
+    x = ""
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+

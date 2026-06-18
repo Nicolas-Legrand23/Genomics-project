@@ -1,0 +1,28 @@
+install.packages(c(
+  "tidyverse",
+  "GEOquery",
+  "DESeq2",
+  "pheatmap",
+  "RColorBrewer",
+  "EnhancedVolcano",
+  "BiocManager"
+))
+
+BiocManager::install(c(
+  "org.Hs.eg.db",
+  "clusterProfiler",
+  "AnnotationDbi"
+))
+
+library(tidyverse)
+library(GEOquery)
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+Warnning  :
+
+If R version too rcent for package install throigh BiocManager instead
