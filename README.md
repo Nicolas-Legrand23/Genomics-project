@@ -50,6 +50,9 @@ The report is fully annotated and designed for interpretability.
 
 All contrasts are computed as:
 
+```r
+condition = {NAFL, NASH_F0-F1, NASH_F2, NASH_F3, NASH_F4} vs Control
+```
 
 Below is a summary of the **actual results produced by the pipeline**.
 
